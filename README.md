@@ -1,5 +1,7 @@
 # Agent Doom: GZDoom + Project Brutality while OMP works
 
+![Project Brutality deathmatch against bots in GZDoom](evidence/demo.gif)
+
 This project is an OMP version of an idea from [Jarrod Watts' post](https://x.com/jarrodwatts/status/2105858869482471602). In his Claude Code mod, Doom opens while the agent works. The game closes when the agent replies and shows your K/D. The code here is original. It uses GZDoom, [Project Brutality](https://github.com/pa1nki113r/Project_Brutality) 0.4.1 and the free [Freedoom](https://freedoom.github.io/) IWADs.
 
 ## What it does
