@@ -1,0 +1,9 @@
+# Large third-party release files stay local; releases/SOURCES.md lists their origin and SHA-256.
+releases/*.pk3
+releases/*.zip
+releases/*.sig
+releases/*-CHECKSUM
+# Shallow clone of the Project Brutality tag used to build the pk3.
+.work/
+# Local OMP checkpoint
+.omp-status.md

@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# agent-doom: GZDoom + Project Brutality launcher, with a "play while the agent
+# works" session that an OMP extension starts and stops.
+#
+# Commands:
+#   play [opts] [-- gzdoom args]  Normal game (Omarchy menu entry). Not stopped by the agent.
+#   start [opts]                  Start the agent-wait session in the background (no-op if running).
+#   stop [--notify] [--json]      Close the agent-wait session and print the score.
+#   status                        Show whether the agent-wait session runs.
+#   kd [--json]                   Show the score of the last closed session.
+#   on | off | enabled            Opt in/out of automatic launch by the OMP extension.
+#   doctor                        Check the installation.
+#
+# Options for play/start:
+#   --mode solo|bots|host|join   solo: Freedoom: Phase 2 campaign map vs monsters (default)
+#                                bots: FreeDM deathmatch vs local bots
+#                                host: FreeDM deathmatch netgame host (--players N)
+#                                join: join a netgame host (--join ADDRESS[:PORT])
+#   --map MAPxx  --skill 1-5  --bots N  --players N  --join ADDR  --port N
+#
+# Settings: ~/.config/agent-doom/config (KEY=value lines, see README).
+set -euo pipefail
+
+prog=agent-doom
+conf_dir="${XDG_CONFIG_HOME:-$HOME/.config}/agent-doom"
+data_dir="${AGENT_DOOM_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/agent-doom}"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/agent-doom"
+unit=agent-doom-session
+
+# Defaults; the config file may override them.
+AGENT_DOOM_MODE=solo
+AGENT_DOOM_SKILL=3
+AGENT_DOOM_BOTS=3
+AGENT_DOOM_PLAYERS=2
+AGENT_DOOM_PORT=5029
+AGENT_DOOM_JOIN=
+AGENT_DOOM_MAP=
+AGENT_DOOM_TARGET=local
+AGENT_DOOM_GZDOOM=
+# Optional: path to your own Doom II IWAD for the campaign (solo) mode.
+# Empty means Freedoom: Phase 2. The file is used in place and never copied.
+AGENT_DOOM_IWAD=
+if [[ -f "$conf_dir/config" ]]; then
+	# shellcheck disable=SC1091
+	source "$conf_dir/config"
+fi
+
+die() { printf '%s: %s\n' "$prog" "$*" >&2; exit 1; }
+
+# Run the same command on another machine when the user plays there
+# (for example: OMP runs on omarchy-rig over SSH, the user sits at omarchy-mac).
+if [[ "${AGENT_DOOM_TARGET}" != local && -z "${AGENT_DOOM_REMOTE:-}" ]]; then
+	case "${1:-}" in
+	start | stop | status | kd)
+		quoted=$(printf '%q ' "$@")
+		exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$AGENT_DOOM_TARGET" \
+			"AGENT_DOOM_REMOTE=1 \$HOME/.local/bin/agent-doom $quoted"
+		;;
+	esac
+fi
+
+find_gzdoom() {
+	local c
+	for c in "$AGENT_DOOM_GZDOOM" "$(command -v gzdoom 2>/dev/null || true)" \
+		"$HOME/.local/bin/gzdoom" "$HOME/.local/opt/gzdoom/gzdoom"; do
+		[[ -n "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+	done
+	return 1
+}
+
+find_pb() {
+	local f
+	for f in "$data_dir"/mods/project-brutality*.pk3; do
+		[[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
+	done
+	return 1
+}
+
+# Import the desktop session environment when called from SSH or a service.
+desktop_env() {
+	export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+	export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+	if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+		local line
+		while IFS= read -r line; do
+			case "$line" in
+			WAYLAND_DISPLAY=* | DISPLAY=* | HYPRLAND_INSTANCE_SIGNATURE=* | XDG_CURRENT_DESKTOP=* | XDG_SESSION_TYPE=*)
+				export "${line?}" ;;
+			esac
+		done < <(systemctl --user show-environment 2>/dev/null || true)
+	fi
+}
+
+# Build the GZDoom argument list in the global array "gz".
+build_args() {
+	local mode="$1" map="$2" skill="$3" bots="$4" players="$5" join="$6" port="$7" logfile="$8"
+	local pb iwad
+	pb=$(find_pb) || die "Project Brutality pk3 missing in $data_dir/mods (run install.sh)"
+	[[ -f "$data_dir/mods/agentdoom.pk3" ]] || die "agentdoom.pk3 missing in $data_dir/mods (run install.sh)"
+	case "$mode" in
+	solo) iwad="${AGENT_DOOM_IWAD:-$data_dir/iwads/freedoom2.wad}" ;;
+	bots | host | join) iwad="$data_dir/iwads/freedm.wad" ;;
+	*) die "unknown mode: $mode" ;;
+	esac
+	[[ -f "$iwad" ]] || die "IWAD missing: $iwad (run install.sh)"
+	mkdir -p "$conf_dir" "$state_dir/saves" "$state_dir/screenshots"
+	gz=(-iwad "$iwad" -file "$pb" "$data_dir/mods/agentdoom.pk3"
+		-config "$conf_dir/gzdoom.ini" -savedir "$state_dir/saves"
+		+screenshot_dir "$state_dir/screenshots")
+	[[ -n "$logfile" ]] && gz+=(+logfile "$logfile")
+	case "$mode" in
+	solo)
+		[[ -z "$map" ]] && map=$(printf 'MAP%02d' $((RANDOM % 32 + 1)))
+		gz+=(-skill "$skill" +map "$map") ;;
+	bots)
+		[[ -z "$map" ]] && map=$(printf 'MAP%02d' $((RANDOM % 32 + 1)))
+		gz+=(-deathmatch -skill "$skill" +map "$map")
+		# -bots spawns named bots from ~/.config/gzdoom/bots.cfg once the map runs.
+		local names=("Merge Conflict" "Flaky Test" "Rebase" "Linter" "Cold Cache")
+		if ((bots > ${#names[@]})); then bots=${#names[@]}; fi
+		if ((bots > 0)); then gz+=(-bots "${names[@]:0:bots}"); fi ;;
+	host)
+		[[ -z "$map" ]] && map=MAP01
+		gz+=(-host "$players" -port "$port" -deathmatch -skill "$skill" +map "$map") ;;
+	join)
+		[[ -n "$join" ]] || die "--mode join needs --join ADDRESS[:PORT]"
+		gz+=(-join "$join" -port "$port") ;;
+	esac
+}
+
+parse_opts() {
+	mode="$AGENT_DOOM_MODE" map="$AGENT_DOOM_MAP" skill="$AGENT_DOOM_SKILL" bots="$AGENT_DOOM_BOTS"
+	players="$AGENT_DOOM_PLAYERS" join="$AGENT_DOOM_JOIN" port="$AGENT_DOOM_PORT" extra=()
+	while (($#)); do
+		case "$1" in
+		--mode) mode="$2"; shift 2 ;;
+		--map) map="$2"; shift 2 ;;
+		--skill) skill="$2"; shift 2 ;;
+		--bots) bots="$2"; shift 2 ;;
+		--players) players="$2"; shift 2 ;;
+		--join) join="$2"; mode="join"; shift 2 ;;
+		--port) port="$2"; shift 2 ;;
+		--) shift; extra=("$@"); break ;;
+		*) die "unknown option: $1" ;;
+		esac
+	done
+	[[ "$skill" =~ ^[1-5]$ ]] || die "--skill must be 1-5"
+	[[ "$bots" =~ ^[0-9]+$ && "$players" =~ ^[0-9]+$ && "$port" =~ ^[0-9]+$ ]] || die "numbers expected"
+	[[ -z "$map" || "$map" =~ ^[A-Za-z0-9_]+$ ]] || die "bad map name"
+}
+
+is_running() { systemctl --user is-active --quiet "$unit.service" 2>/dev/null; }
+
+# Print the score from a session log. Output: "kills frags deaths map".
+read_score() {
+	local log="$1" line
+	line=$(grep -a '^AGENTDOOM ' "$log" 2>/dev/null | tail -n 1 || true)
+	[[ -n "$line" ]] || { echo "0 0 0 -"; return; }
+	sed -E 's/^AGENTDOOM kills=([0-9]+) frags=([0-9]+) deaths=([0-9]+) map=([^[:space:]]*).*/\1 \2 \3 \4/' <<<"$line"
+}
+
+# Write last.json for the current session and set the summary text in "summary_text".
+# $1: end time (epoch seconds).
+write_summary() {
+	local ended="$1" kills frags deaths map started secs kd
+	read -r kills frags deaths map < <(read_score "$state_dir/session.log")
+	started=$(cat "$state_dir/session.started" 2>/dev/null || echo "$ended")
+	secs=$((ended > started ? ended - started : 0))
+	kd=$(awk -v k=$((kills + frags)) -v d="$deaths" 'BEGIN { printf "%.2f", (d > 0 ? k / d : k) }')
+	printf '{"kills":%d,"frags":%d,"deaths":%d,"kd":%s,"map":"%s","seconds":%d,"ended":%d}\n' \
+		"$kills" "$frags" "$deaths" "$kd" "$map" "$secs" "$ended" >"$state_dir/last.json"
+	summary_text=$(printf 'Agent Doom: %d kills, %d frags, %d deaths, K/D %s on %s (%dm%02ds)' \
+		"$kills" "$frags" "$deaths" "$kd" "$map" $((secs / 60)) $((secs % 60)))
+}
+
+cmd_play() {
+	parse_opts "$@"
+	local gzbin
+	gzbin=$(find_gzdoom) || die "gzdoom not found"
+	build_args "$mode" "$map" "$skill" "$bots" "$players" "$join" "$port" ""
+	desktop_env
+	if command -v uwsm-app >/dev/null 2>&1; then
+		exec uwsm-app -- "$gzbin" "${gz[@]}" "${extra[@]}"
+	fi
+	exec "$gzbin" "${gz[@]}" "${extra[@]}"
+}
+
+cmd_start() {
+	parse_opts "$@"
+	if is_running; then
+		echo "$prog: session already running"
+		return 0
+	fi
+	local gzbin
+	gzbin=$(find_gzdoom) || die "gzdoom not found"
+	mkdir -p "$state_dir"
+	: >"$state_dir/session.log"
+	build_args "$mode" "$map" "$skill" "$bots" "$players" "$join" "$port" "$state_dir/session.log"
+	date +%s >"$state_dir/session.started"
+	desktop_env
+	systemctl --user reset-failed "$unit.service" 2>/dev/null || true
+	systemd-run --user --quiet --collect --unit="$unit" \
+		--description="Agent Doom session (GZDoom + Project Brutality)" \
+		-p TimeoutStopSec=6 \
+		--setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+		--setenv=DISPLAY="${DISPLAY:-}" \
+		--setenv=XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+		--setenv=HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}" \
+		--setenv=SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland,x11}" \
+		-- "$gzbin" "${gz[@]}" "${extra[@]}"
+	echo "$prog: session started ($mode)"
+}
+
+cmd_stop() {
+	local notify=0 json=0
+	while (($#)); do
+		case "$1" in
+		--notify) notify=1 ;;
+		--json) json=1 ;;
+		*) die "unknown option: $1" ;;
+		esac
+		shift
+	done
+	local ended
+	if is_running; then
+		# SIGTERM makes SDL post a quit event; GZDoom then exits cleanly and closes its log.
+		# systemd sends SIGKILL after TimeoutStopSec (for example while GZDoom waits for netgame players).
+		systemctl --user stop "$unit.service" 2>/dev/null || true
+		ended=$(date +%s)
+	elif [[ -f "$state_dir/session.started" ]]; then
+		# The user already quit the game: report that session once, ending at its last log write.
+		ended=$(stat -c %Y "$state_dir/session.log" 2>/dev/null || date +%s)
+	else
+		if [[ "$json" == 1 ]]; then echo '{"running":false}'; else echo "$prog: no session running"; fi
+		return 0
+	fi
+	local summary_text
+	write_summary "$ended"
+	rm -f "$state_dir/session.started"
+	if [[ "$json" == 1 ]]; then cat "$state_dir/last.json"; else printf '%s\n' "$summary_text"; fi
+	if [[ "$notify" == 1 ]] && command -v notify-send >/dev/null 2>&1; then
+		desktop_env
+		notify-send -a "Agent Doom" -i gzdoom "Agent finished" "$summary_text" 2>/dev/null || true
+	fi
+}
+
+cmd_kd() {
+	if [[ "${1:-}" == --json ]]; then
+		cat "$state_dir/last.json" 2>/dev/null || echo '{}'
+		return 0
+	fi
+	[[ -f "$state_dir/last.json" ]] || { echo "$prog: no finished session yet"; return 0; }
+	local j
+	j=$(cat "$state_dir/last.json")
+	printf 'Last session: %s\n' "$j"
+}
+
+cmd_doctor() {
+	local ok=1 f
+	if gzbin=$(find_gzdoom); then echo "ok  gzdoom: $gzbin"; else echo "ERR gzdoom not found"; ok=0; fi
+	for f in iwads/freedoom2.wad iwads/freedm.wad mods/agentdoom.pk3; do
+		if [[ -f "$data_dir/$f" ]]; then echo "ok  $f"; else echo "ERR $data_dir/$f missing"; ok=0; fi
+	done
+	if f=$(find_pb); then echo "ok  $(basename "$f")"; else echo "ERR Project Brutality pk3 missing"; ok=0; fi
+	if [[ -f "$conf_dir/enabled" ]]; then echo "ok  OMP auto-launch: on"; else echo "ok  OMP auto-launch: off (agent-doom on)"; fi
+	echo "ok  target: $AGENT_DOOM_TARGET, mode: $AGENT_DOOM_MODE"
+	[[ "$ok" == 1 ]]
+}
+
+cmd="${1:-play}"
+(($#)) && shift
+case "$cmd" in
+play) cmd_play "$@" ;;
+start) cmd_start "$@" ;;
+stop) cmd_stop "$@" ;;
+status) if is_running; then echo running; else echo stopped; fi ;;
+kd) cmd_kd "$@" ;;
+on) mkdir -p "$conf_dir" && : >"$conf_dir/enabled" && echo "$prog: OMP auto-launch on" ;;
+off) rm -f "$conf_dir/enabled" && echo "$prog: OMP auto-launch off" ;;
+enabled) [[ -f "$conf_dir/enabled" ]] && echo on || { echo off; exit 1; } ;;
+doctor) cmd_doctor ;;
+-h | --help | help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+*) die "unknown command: $cmd (try --help)" ;;
+esac
