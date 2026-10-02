@@ -75,3 +75,10 @@ Use `AGENT_DOOM_TARGET` when OMP runs on one machine (for example `omarchy-rig` 
 node tests/extension.test.mjs   # no game window
 tests/smoke.sh                  # opens and closes a real game window
 ```
+
+## GZDoom lessons (confirmed on omarchy-rig, 2026-10-02, GZDoom 4.14.2)
+
+- Console commands on the command line (`+wait`, `+addbot`, `+netevent`) can run before the map loads. Use `-bots NAME...` with `~/.config/gzdoom/bots.cfg`, or an in-game ZScript handler.
+- GZDoom ignores SIGTERM while a netgame waits for players. `agent-doom stop` relies on systemd's SIGKILL after 6 s in that case.
+- In join mode, `-port` sets the joiner's own local port. Two copies on one host need different ports.
+- `gzdoom -norun` without an IWAD opens a "Fatal error" window. Do not use it to check the version.
